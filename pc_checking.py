@@ -37,6 +37,20 @@ SUSPECT_SOFTWARE = [
 # Puedes ajustar esto
 EXTENSIONES_SOSPECHOSAS = [".exe", ".bat", ".ps1", ".vbs", ".jar", ".scr", ".com"]
 
+dispositivos_conocidos = [
+        "Intel",
+        "NVIDIA",
+        "Realtek",
+        "AMD",
+        "Standard SATA AHCI Controller",
+        "USB Host Controller",
+        "Intel(R) Management Engine Interface",
+        "PCI Express Root Port",
+        "Bluetooth",
+        "Wi-Fi",
+        "Ethernet",
+    ]
+
 # Carpetas típicas para buscar trampas
 CARPETAS_CLAVE = [
     os.path.expanduser("~/Desktop"),
@@ -202,24 +216,51 @@ def instalar_sysmon():
 
 
 def detectar_dispositivos_dma_avanzado():
-    resultado = ["\n🔌 Verificación de dispositivos externos conectados (DMA):"]
+    resultado = ["\n🎯 Escaneo de posibles trampas DMA (aimbot hardware):"]
+
+    # Palabras clave sospechosas (comunes en trampas DMA)
+    palabras_clave_sospechosas = [
+        "thunderbolt", "fpga", "external", "dma", "capture", "inject", "interceptor"
+    ]
+
     try:
-        # Buscar dispositivos con nombres clave relacionados a DMA
+        # Obtener dispositivos con relación a DMA o acceso directo
         cmd = (
-            "Get-PnpDevice | Where-Object { $_.FriendlyName -match 'thunderbolt|pci|express|dma' -or $_.Class -match 'System|PCI' }"
+            "Get-PnpDevice | Where-Object { "
+            "$_.FriendlyName -match 'thunderbolt|pci|express|fpga|dma|external|capture' -or "
+            "$_.InstanceId -match 'PCI' -or "
+            "$_.Class -match 'System|Media|Net' } "
+            "| Select-Object FriendlyName, InstanceId, Manufacturer"
         )
+
         proceso = subprocess.run(
             ["powershell", "-Command", cmd],
             capture_output=True, text=True, shell=True
         )
         salida = proceso.stdout.strip()
+
         if salida:
-            resultado.append("⚠️ Dispositivos potencialmente DMA detectados:\n")
-            resultado.append(salida)
+            lineas = salida.splitlines()
+            sospechosos = []
+
+            for linea in lineas:
+                # Si contiene palabra clave sospechosa Y no está en la lista blanca
+                if (
+                        any(palabra in linea.lower() for palabra in palabras_clave_sospechosas)
+                        and not any(conocido.lower() in linea.lower() for conocido in dispositivos_conocidos)
+                ):
+                    sospechosos.append(linea)
+
+            if sospechosos:
+                resultado.append("⚠️ Dispositivos NO reconocidos con riesgo potencial (posibles trampas DMA):\n")
+                resultado.extend(sospechosos)
+            else:
+                resultado.append("✅ No se detectaron trampas DMA fuera de la lista blanca.")
         else:
-            resultado.append("✅ No se detectaron dispositivos externos relacionados con DMA.")
+            resultado.append("✅ No se encontraron dispositivos DMA sospechosos.")
     except Exception as e:
-        resultado.append(f"❌ Error al consultar dispositivos DMA: {e}")
+        resultado.append(f"❌ Error durante el escaneo de trampas DMA: {e}")
+
     return "\n".join(resultado)
 
 
@@ -473,6 +514,28 @@ def system_summary():
     info.append(f"Tiempo activo: {uptime}")
     return "\n".join(info)
 
+def detectar_ejecuciones_desde_red():
+    info = []
+    info.append("\n🌐 Procesos ejecutados desde red compartida (UNC o mapeada):")
+    encontrados = False
+
+    for proc in psutil.process_iter(['pid', 'name', 'exe']):
+        try:
+            exe_path = proc.info['exe']
+            if exe_path and (exe_path.startswith('\\\\') or exe_path[0] in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' and exe_path[1:3] == ':\\'):
+                # Verificar si la unidad es una red mapeada
+                letra = exe_path[0]
+                ruta_mapeada = f"{letra}:\\"
+                tipo = ctypes.windll.kernel32.GetDriveTypeW(ruta_mapeada)
+                if exe_path.startswith('\\\\') or tipo == 4:  # DRIVE_REMOTE
+                    info.append(f"⚠️ {proc.info['name']} (PID {proc.pid}) desde: {exe_path}")
+                    encontrados = True
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if not encontrados:
+        info.append("✅ No se detectaron procesos desde rutas de red.")
+    return "\n".join(info)
 
 def check_suspicious_processes():
     info = []
@@ -683,18 +746,17 @@ def es_firmado_digitalmente(ruta_archivo):
 
 
 def listar_servicios_y_drivers():
-    # Lista negra básica para detectar nombres sospechosos (puedes ampliarla)
+    info = []
+    info.append("\n🧩 Análisis de servicios y drivers del sistema:")
+
     lista_negra = ["hack", "cheat", "aimbot", "wallhack", "inject", "trap", "crack"]
 
-    # Obtenemos todos los servicios con sc query
-    servicios = []
     try:
         salida = subprocess.check_output("sc query type= service state= all", shell=True, text=True)
     except Exception as e:
-        print("Error al listar servicios:", e)
-        return []
+        info.append(f"❌ Error al listar servicios: {e}")
+        return "\n".join(info)
 
-    # Parseo simple de la salida de sc query
     servicios_raw = salida.split("\n\n")
     for servicio_raw in servicios_raw:
         if not servicio_raw.strip():
@@ -710,45 +772,31 @@ def listar_servicios_y_drivers():
         sospechoso = False
         razon_sospecha = []
 
-        # Comprobar lista negra en nombre
         for palabra in lista_negra:
-            if palabra.lower() in nombre.lower():
+            if palabra in nombre.lower():
                 sospechoso = True
                 razon_sospecha.append(f"Nombre sospechoso ({palabra})")
 
-        # Comprobar ruta sospechosa
         if ruta:
             ruta_lower = ruta.lower()
             if any(x in ruta_lower for x in ["temp", "appdata", "downloads", "user\\"]):
                 sospechoso = True
                 razon_sospecha.append(f"Ruta sospechosa: {ruta}")
 
-        # Comprobar existencia y firma digital básica
         firmado = es_firmado_digitalmente(ruta) if ruta else False
         if not firmado:
             sospechoso = True
-            razon_sospecha.append("Archivo no firmado o no encontrado")
+            razon_sospecha.append("No firmado digitalmente o archivo no encontrado")
 
-        servicios.append({
-            "nombre": nombre,
-            "estado": estado,
-            "ruta": ruta or "Desconocida",
-            "firmado": firmado,
-            "sospechoso": sospechoso,
-            "razon": "; ".join(razon_sospecha)
-        })
+        resumen = f"🔧 Servicio: {nombre} | Estado: {estado} | Ruta: {ruta or 'Desconocida'}"
+        if sospechoso:
+            resumen += f"\n    ⚠️ Sospechoso → {'; '.join(razon_sospecha)}"
+        else:
+            resumen += f"\n    ✅ Sin anomalías detectadas"
+        info.append(resumen)
 
-    # Mostrar resultado
-    for s in servicios:
-        print(f"Servicio: {s['nombre']}")
-        print(f"  Estado: {s['estado']}")
-        print(f"  Ruta: {s['ruta']}")
-        print(f"  Firmado digitalmente: {'Sí' if s['firmado'] else 'No'}")
-        if s['sospechoso']:
-            print(f"  ¡Sospechoso! Razón: {s['razon']}")
-        print("-" * 40)
+    return "\n".join(info)
 
-    return servicios
 
 
 if __name__ == "__main__":
@@ -763,12 +811,13 @@ if __name__ == "__main__":
         else:
             print("🚫 Se omitirá el análisis avanzado con Sysmon.")
 
-    print("===== PC Check - Análisis básico de trampas o anomalías =====")
+    # print("===== PC Check - Análisis básico de trampas o anomalías =====")
 
     resultados = []
 
     resultados.append(system_summary())
     resultados.append(check_suspicious_processes())
+    resultados.append(detectar_ejecuciones_desde_red())
     resultados.append(check_recently_installed_programs())
     resultados.append(check_active_connections(known_programs))
 
@@ -782,7 +831,6 @@ if __name__ == "__main__":
     resultados.append(leer_eventos_sysmon_procesos_recientes())
     resultados.append(detectar_dispositivos_dma_avanzado())
     resultados.append(verificar_proteccion_dma_kernel())
-    guardar_archivos_sospechosos_json(archivos_json)
 
     todo_el_texto = "\n\n".join(resultados)
     print(todo_el_texto)
